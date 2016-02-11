@@ -1,0 +1,205 @@
+#!/usr/local/bin/perl
+
+
+# This VREF enforces workflow rules, which are input via the specified input file.
+# The input filename is specified via the VREF in the gitolite conf file, and is assumed
+# to be checked into the gitolite-admin repository.
+#
+# Each line of this file defines a new rule, with the
+# syntax  '<name>:<leftex>:<rule>:<rightexpr>:<message>'.  Lines that begin with # are ignored.
+# Leading and trailing whitespace in any captured section are ignored.
+# 
+# where <name> is simply the name of this rule,  <leftex> is a psuedo perl regular expression 
+# that operations on the incoming ref, and in which captured tokens will be available
+# for expansion in <rightexpr> and <message>. Note that forward-slashes will be automatically 
+# escaped, and if the <leftex> does not begin with 'refs', then 'refs/heads/' is assumed.
+#
+# <rightexpr> is a psuedo-executable perl expression that expands the tokens (indicated
+# by parenthesis groups) captured in left ex by using numbered variables (i.e. $1, $2, etc..) The
+# resulting expanded string is the right-hand ref used for the rule.
+#
+# <message> is displayed if the VREF denies the push. Captured tokens can be put into the message similar
+# to <rightexpr> ($1, $2, etc..)
+#
+#  If the incoming ref matches the <leftex> regular expression, the rule is checked against the expanded
+#  <rightexpr> ref 
+#
+# The <rule> is a keyword to define the rule to apply between <leftex> and <rightexpr>, and must 
+# be one of:
+#      'MUST_BE_ANCESTOR_OF'             - enforces that the incoming ref must be an ancestor of <ancestor_ref>, 
+#                                          will DENY if that is not the case, or if <ancestor_ref> does not exist.
+#
+#      'MUST_BE_ANCESTOR_OF_IF_EXISTS'   - same as above, but passes if ancestor_ref does not exist.
+#
+#  Example InputFile:
+#     /dev ahead of /stable:  (\w+)/stable         : MUST_BE_ANCESTOR_OF           : $1/dev       : You should push to $1/dev before pushing to $1/stable!
+#     herd cats            :  (\w+)/(\w+)/(int.*)  : MUST_BE_ANCESTOR_OF_IF_EXISTS : $1/dev       : Program specific branch $1/$2/$3 must be an ancestor of the shared branch $1/dev. (You should push to $1/dev first.)
+#     /comp before /int    :  (\w+)/(\w+)/int.*    : MUST_BE_ANCESTOR_OF_IF_EXISTS : $1/$2/comp   : The 'integrated' branch ($1/$2/$3) must be an ancestor of the 'compiles' branch. (You should push to $1/$2/comp first.)
+#     /int before /silver  :  (\w+)/(\w+)/silver.* : MUST_BE_ANCESTOR_OF           : $1/$2/int    : The 'silver' branch ($1/$2/silver) must be an ancestor of the 'integrated' branch. (You should push to $1/$2/int first.)
+#     /silver before /gold :  (\w+)/(\w+)/gold.*   : MUST_BE_ANCESTOR_OF           : $1/$2/silver : The 'gold' branch ($1/$2/silver) must be an ancestor of the 'silver' branch. (You should push to $1/$2/silver first.)
+# 
+
+use strict;
+use warnings;
+use Cwd;
+use File::Basename; 
+
+
+
+
+my $ref    = $ARGV[0];
+my $oldsha = $ARGV[1];
+my $newsha = $ARGV[2];
+my $oldtreesha = $ARGV[3];
+my $newwtreesha = $ARGV[4];
+my $accessflag = $ARGV[5];
+my $refex  = $ARGV[6];
+
+#Join all the last arguments to build the full filename.
+my $inputfilename = join "/",@ARGV[7..$#ARGV];
+$inputfilename = "$ENV{GITOLITE_HTTP_HOME}/.gitolite/$inputfilename";
+my $baseDir = getcwd;
+my $scriptname = basename($0);
+
+
+
+if($newsha eq "0000000000000000000000000000000000000000" ){
+	print "$scriptname: Delete OK\n";
+	exit 0;
+}
+
+
+# Open the input file
+open my $fh, '<', $inputfilename or die "$scriptname: Cannot open $inputfilename: $!";
+
+debugprint("$scriptname: opened $inputfilename for reading!\n");
+
+my $lineno = 0;
+while(my $line = <$fh>){
+	$lineno++;
+	
+	#1 - Remove unimportant (leading / trailing) whitespace
+	$line =~  s/^\s+|\s+$//g;
+	
+	#2 - If line begins with # or is empty, then skip
+	if( length($line) == 0 || substr($line,0,1) eq '#'){
+		next;
+	}
+	
+	#Parse the delimiter
+	my @values = split(':',$line);
+	
+	#Should get five entries
+	my $numvals = scalar(@values);
+	if( $numvals != 5){
+		print "$scriptname: WARNING! Line number $lineno of input file $inputfilename is malformed! Expecting five entries delimited by ':', found $numvals!\n";
+		next;
+	}
+	
+	my $name        = $values[0];
+	my $leftex      = $values[1];
+	my $operation   = $values[2];
+	my $rightexpr	= $values[3];
+	my $message	    = $values[4];
+	
+	debugprint("$scriptname: Line $lineno parsed name: '$name' left: '$leftex', op: '$operation', right: '$rightexpr', message: '$message'\n");
+	
+	#remove unimportant whitespace
+	$name      =~ s/^\s+|\s+$//g;
+	$leftex    =~  s/^\s+|\s+$//g;
+	$operation =~  s/^\s+|\s+$//g;
+	$rightexpr =~  s/^\s+|\s+$//g;
+	$message   =~ s/^\s+|\s+$//g;
+	
+	debugprint("$scriptname: Line $lineno parsed name: '$name' left: '$leftex', op: '$operation', right: '$rightexpr', message: '$message'\n");
+	
+	
+	#if leftex doesn't start with refs, then assume refs/heads
+	if(substr($leftex,0,5) ne "refs/"){
+		$leftex = "refs/heads/$leftex";
+	}
+	if(substr($rightexpr,0,5) ne "refs/"){
+		$rightexpr = "refs/heads/$rightexpr";
+	}
+	
+	debugprint("$scriptname: Line $lineno parsed left: '$leftex', op: '$operation', right: '$rightexpr'\n");
+	
+	#Find the replace variables in rightexpr (looking for $1, $2, etc..)
+	my @replacevars = $rightexpr =~ m{(\$[\d]+)}g;
+	
+	#Find number of left parenthesis in leftex (this is the number of replacements that we will look for.
+	 my $numReplacements = 0;
+	 $numReplacements++ while ($leftex =~ m/\(/g);
+	
+	debugprint("$scriptname: Found replacevars " . join(",",@replacevars) . "\n");
+
+	
+	if( $operation eq "MUST_BE_ANCESTOR_OF" or $operation  eq "MUST_BE_ANCESTOR_OF_IF_EXISTS"){
+		#Any ref that matches refex must be ancestor of resulting ref on the right.
+		
+		debugprint("$scriptname: Attempting to match incoming ref '$ref' to regex: $leftex\n");
+		if( $ref =~ m{$leftex}){
+			debugprint("$scriptname: Matched incoming ref '$ref' to line $lineno: $leftex!\n");
+			my $ancestor_ref = $rightexpr;
+			debugprint("$scriptname: ancestor_ref = $ancestor_ref\n");
+			
+			#Matched the ref, now check the ancestor rules.
+			#Build the right-hand side.  Look for $1, etc. and replace with result
+			my @ReplaceStrs;
+			foreach my $replaceNum (1 .. $numReplacements ){
+				my $replaceVar = "\$$replaceNum";
+				#Eval the numbersign variable, will be something like "$1", "$2", etc...
+				my $replaceStr = eval($replaceVar);
+				debugprint("$scriptname: $replaceVar eval'd to '$replaceStr'\n");
+				push(@ReplaceStrs,$replaceStr);
+			}
+			
+			#Expand ancestor_ref and message
+			foreach my $replaceNum (1 .. $numReplacements ){
+				my $replaceVar = "\$$replaceNum";
+				my $replaceStr = $ReplaceStrs[$replaceNum-1];
+				$ancestor_ref =~ s{\Q$replaceVar\E}{\Q$replaceStr\E}g;
+				$message =~ s{\Q$replaceVar\E}{\Q$replaceStr\E}g;
+				debugprint("$scriptname: After processing $replaceVar ('$replaceStr'), ancestor_ref is: $ancestor_ref\n");
+				debugprint("$scriptname: After processing $replaceVar ('$replaceStr'), message is: $message\n");
+			}	
+			#Now see if we have ancestor ref in this repo
+			
+			debugprint("$scriptname: Checking for ancestor ref: $ancestor_ref!\n");
+			# See if /ancestor_ref exists yet. if not then use the current sha-1
+			my $ret = `git show-ref -q --verify "$ancestor_ref"`;
+			
+			if($? != 0 and $operation eq "MUST_BE_ANCESTOR_OF"){
+				# ancestor_ref doesn't exist BUT our rule says the current ref must be an ancestor!
+				
+				#Printing $refex on the first line causes gitolite to deny this!
+				print "$refex FATAL: $scriptname:$name:$message ($operation rule requires incoming '$ref' must be ancestor of '$ancestor_ref', but $ancestor_ref doesn't exist on the server. (from line $lineno of $inputfilename)\n";
+				exit 0;	
+			}
+			elsif($? != 0){
+				# ancestor_ref doesn't exist, our operation 'MUST_BE_ANCESTOR_OF_IF_EXISTS' says thats OK.
+				print "$scriptname:$name: OK because '$ancestor_ref' does not exist\n";
+			}
+			else{
+				#ancestor ref does exist, check to make sure we are indeed an ancestor.
+				my $ret = `git merge-base --is-ancestor $newsha "$ancestor_ref" 2>&1`;
+				if($? == 0){
+					print "$scriptname:$name: OK because '$ref' is an ancestor of '$ancestor_ref'\n";
+				}
+				else{
+					print "$refex FATAL: $scriptname:$name:$message ($operation rule requires incoming '$ref' must be ancestor of '$ancestor_ref' (from line $lineno of $inputfilename)\n";
+					exit 0;	
+				}
+			}
+		}
+	}
+}
+close($fh);
+print "$scriptname: OK \n";
+
+exit 0;
+
+sub debugprint
+{
+#	print "@_";
+}
